@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vetorizador de Documentos Jurídicos</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            background-color: #f4f4f9;
+            color: #333;
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 20px;
+            box-shadow: 0 2px 15px rgba(0,0,0,0.1);
+            border-radius: 8px;
+        }
+        h1 {
+            color: #0056b3;
+            text-align: center;
+        }
+        #controls {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        input[type="file"] {
+            padding: 10px;
+            border: 2px dashed #ccc;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button {
+            padding: 12px 20px;
+            font-size: 16px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+        button:hover:not(:disabled) {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #e9ecef;
+            border-left: 5px solid #007bff;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Vetorizador de Documentos (RAG)</h1>
+
+    <div id="controls">
+        <label for="jsonFile">1. Selecione o arquivo JSON estruturado:</label>
+        <input type="file" id="jsonFile" accept=".json">
+        
+        <button id="vectorizeButton">2. Vetorizar Documentos</button>
+    </div>
+
+    <div id="status" style="display: none;"></div>
+
+    <script type="module">
+        // Importa as funções necessárias da biblioteca
+        import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.1';
+
+        // Correção 1: Desativa a busca por modelos na pasta local.
+        env.allowLocalModels = false;
+
+        // Correção 2: Garante que o script só execute após o carregamento completo do HTML.
+        document.addEventListener('DOMContentLoaded', () => {
+            
+            // Referências aos elementos do HTML
+            const fileInput = document.getElementById('jsonFile');
+            const vectorizeButton = document.getElementById('vectorizeButton');
+            const statusDiv = document.getElementById('status');
+
+            // Função para atualizar e exibir o status do processo
+            function updateStatus(message) {
+                statusDiv.style.display = 'block';
+                statusDiv.textContent = message;
+            }
+            
+            // Adiciona um listener ao clique do botão
+            vectorizeButton.addEventListener('click', async () => {
+                if (fileInput.files.length === 0) {
+                    updateStatus('Erro: Por favor, selecione um arquivo JSON primeiro.');
+                    return;
+                }
+
+                vectorizeButton.disabled = true;
+                const file = fileInput.files[0];
+
+                try {
+                    updateStatus(`Lendo o arquivo: ${file.name}...`);
+                    const fileContent = await file.text();
+                    const data = JSON.parse(fileContent);
+
+                    updateStatus('Carregando o modelo de embedding... (Isso pode levar um tempo na primeira vez)');
+                    const extractor = await pipeline('feature-extraction', 'Xenova/paraphrase-multilingual-MiniLM-L12-v2', {
+                        progress_callback: (progress) => {
+                            updateStatus(`Carregando modelo: ${progress.file} (${Math.round(progress.progress)}%)`);
+                        }
+                    });
+                    
+                    updateStatus('Extraindo textos para vetorização...');
+                    const chunksParaVetorizar = [];
+                    for (const doc of data.documents || []) {
+                        const allChunks = [
+                            ...(doc.tese_juridica_chunks || []),
+                            ...(doc.fundamentacao_chunks || []),
+                            ...(doc.conclusao_chunks || []),
+                            ...(doc.dod_teste_chunks || [])
+                        ];
+                        for (const chunk of allChunks) {
+                            chunksParaVetorizar.push({
+                                document_id: doc.id_info,
+                                chunk_id: chunk.chunk_id,
+                                text: chunk.text
+                            });
+                        }
+                    }
+                    const textos = chunksParaVetorizar.map(chunk => chunk.text);
+                    
+                    updateStatus(`Vetorizando ${textos.length} trechos de texto...`);
+                    const embeddings = await extractor(textos, { pooling: 'mean', normalize: true });
+
+                    const embeddingsArray = Array.from(embeddings.data);
+                    const embeddingDimension = embeddings.dims[1];
+
+                    for (let i = 0; i < chunksParaVetorizar.length; i++) {
+                        const start = i * embeddingDimension;
+                        const end = start + embeddingDimension;
+                        chunksParaVetorizar[i].embedding = embeddingsArray.slice(start, end);
+                    }
+
+                    updateStatus(`Vetorização concluída com sucesso! ${chunksParaVetorizar.length} chunks foram vetorizados.`);
+                    vectorizeButton.disabled = false;
+
+                    console.log("Processo de vetorização finalizado:", chunksParaVetorizar);
+
+                    const blob = new Blob([JSON.stringify(chunksParaVetorizar, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'dados_vetorizados.json';
+                    a.textContent = 'Baixar Dados Vetorizados';
+                    statusDiv.appendChild(document.createElement('br'));
+                    statusDiv.appendChild(a);
+
+                } catch (error) {
+                    updateStatus(`Ocorreu um erro: ${error.message}`);
+                    console.error(error);
+                    vectorizeButton.disabled = false;
+                }
+            });
+        });
+    </script>
+</body>
+</html>
