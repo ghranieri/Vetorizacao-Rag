@@ -48,6 +48,12 @@
             background-color: #ccc;
             cursor: not-allowed;
         }
+        button.cancel {
+            background-color: #dc3545;
+        }
+        button.cancel:hover:not(:disabled) {
+            background-color: #c82333;
+        }
         #status {
             margin-top: 20px;
             padding: 15px;
@@ -55,17 +61,84 @@
             border-left: 5px solid #007bff;
             font-weight: bold;
         }
+        #status.error {
+            background-color: #f8d7da;
+            border-left-color: #dc3545;
+            color: #721c24;
+        }
+        #status.success {
+            background-color: #d4edda;
+            border-left-color: #28a745;
+            color: #155724;
+        }
+        .progress-container {
+            margin-top: 10px;
+            background-color: #f0f0f0;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        .progress-bar {
+            height: 20px;
+            background-color: #007bff;
+            width: 0%;
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .file-info {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #666;
+        }
+        .controls-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .download-link {
+            display: inline-block;
+            padding: 10px 15px;
+            background-color: #28a745;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            margin-top: 10px;
+            transition: background-color 0.3s ease;
+        }
+        .download-link:hover {
+            background-color: #218838;
+        }
+        .warning {
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            color: #856404;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+        }
     </style>
 </head>
 <body>
 
     <h1>Vetorizador de Documentos (RAG)</h1>
 
+    <div class="warning">
+        <strong>⚠️ Aviso:</strong> Este processo pode ser intensivo e demorar alguns minutos. Certifique-se de que seu arquivo JSON está na estrutura correta.
+    </div>
+
     <div id="controls">
         <label for="jsonFile">1. Selecione o arquivo JSON estruturado:</label>
         <input type="file" id="jsonFile" accept=".json">
+        <div class="file-info" id="fileInfo" style="display: none;"></div>
         
-        <button id="vectorizeButton">2. Vetorizar Documentos</button>
+        <div class="controls-group">
+            <button id="vectorizeButton">2. Vetorizar Documentos</button>
+            <button id="cancelButton" class="cancel" style="display: none;">Cancelar</button>
+        </div>
     </div>
 
     <div id="status" style="display: none;"></div>
@@ -74,94 +147,333 @@
         // Importa as funções necessárias da biblioteca
         import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.1';
 
-        // Correção 1: Desativa a busca por modelos na pasta local.
+        // Configurações
         env.allowLocalModels = false;
+        
+        // Variáveis globais
+        let isProcessing = false;
+        let shouldCancel = false;
 
-        // Correção 2: Garante que o script só execute após o carregamento completo do HTML.
+        // Aguarda o carregamento completo do DOM
         document.addEventListener('DOMContentLoaded', () => {
             
             // Referências aos elementos do HTML
             const fileInput = document.getElementById('jsonFile');
             const vectorizeButton = document.getElementById('vectorizeButton');
+            const cancelButton = document.getElementById('cancelButton');
             const statusDiv = document.getElementById('status');
+            const fileInfo = document.getElementById('fileInfo');
 
-            // Função para atualizar e exibir o status do processo
-            function updateStatus(message) {
-                statusDiv.style.display = 'block';
-                statusDiv.textContent = message;
+            // Função para validar a estrutura do JSON
+            function validateJSONStructure(data) {
+                if (!data || typeof data !== 'object') {
+                    throw new Error('Arquivo JSON inválido');
+                }
+                
+                if (!data.documents || !Array.isArray(data.documents)) {
+                    throw new Error('Estrutura JSON inválida: propriedade "documents" não encontrada ou não é um array');
+                }
+                
+                if (data.documents.length === 0) {
+                    throw new Error('Nenhum documento encontrado no arquivo JSON');
+                }
+                
+                // Verifica se pelo menos um documento tem chunks
+                let hasChunks = false;
+                for (const doc of data.documents) {
+                    if (!doc.id_info) {
+                        throw new Error('Documento sem "id_info" encontrado');
+                    }
+                    
+                    const allChunks = [
+                        ...(doc.tese_juridica_chunks || []),
+                        ...(doc.fundamentacao_chunks || []),
+                        ...(doc.conclusao_chunks || []),
+                        ...(doc.dod_teste_chunks || [])
+                    ];
+                    
+                    if (allChunks.length > 0) {
+                        hasChunks = true;
+                        // Verifica se os chunks têm a estrutura esperada
+                        for (const chunk of allChunks) {
+                            if (!chunk.chunk_id || !chunk.text) {
+                                throw new Error('Chunk inválido encontrado: faltando "chunk_id" ou "text"');
+                            }
+                        }
+                    }
+                }
+                
+                if (!hasChunks) {
+                    throw new Error('Nenhum chunk de texto encontrado nos documentos');
+                }
+                
+                return true;
             }
+
+            // Função para atualizar o status com diferentes tipos
+            function updateStatus(message, type = 'info', progress = null) {
+                statusDiv.style.display = 'block';
+                statusDiv.className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
+                
+                // Remove barra de progresso anterior
+                const existingProgress = statusDiv.querySelector('.progress-container');
+                if (existingProgress) {
+                    existingProgress.remove();
+                }
+                
+                // Remove link de download anterior
+                const existingDownload = statusDiv.querySelector('.download-link');
+                if (existingDownload) {
+                    existingDownload.remove();
+                }
+                
+                statusDiv.textContent = message;
+                
+                // Adiciona barra de progresso se fornecida
+                if (progress !== null) {
+                    const progressContainer = document.createElement('div');
+                    progressContainer.className = 'progress-container';
+                    const progressBar = document.createElement('div');
+                    progressBar.className = 'progress-bar';
+                    progressBar.style.width = `${Math.max(0, Math.min(100, progress))}%`;
+                    progressBar.textContent = `${Math.round(progress)}%`;
+                    progressContainer.appendChild(progressBar);
+                    statusDiv.appendChild(progressContainer);
+                }
+            }
+
+            // Função para formatar tamanho do arquivo
+            function formatFileSize(bytes) {
+                if (bytes === 0) return '0 Bytes';
+                const k = 1024;
+                const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+            }
+
+            // Listener para seleção de arquivo
+            fileInput.addEventListener('change', (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    fileInfo.style.display = 'block';
+                    fileInfo.innerHTML = `
+                        <strong>Arquivo selecionado:</strong> ${file.name}<br>
+                        <strong>Tamanho:</strong> ${formatFileSize(file.size)}<br>
+                        <strong>Tipo:</strong> ${file.type || 'application/json'}
+                    `;
+                    
+                    // Aviso para arquivos grandes
+                    if (file.size > 10 * 1024 * 1024) { // 10MB
+                        fileInfo.innerHTML += '<br><span style="color: #dc3545;">⚠️ Arquivo grande detectado - o processamento pode demorar</span>';
+                    }
+                } else {
+                    fileInfo.style.display = 'none';
+                }
+            });
+
+            // Função para cancelar o processamento
+            function cancelProcessing() {
+                shouldCancel = true;
+                updateStatus('Cancelando processamento...', 'error');
+                vectorizeButton.disabled = false;
+                cancelButton.style.display = 'none';
+                isProcessing = false;
+            }
+
+            // Listener para o botão de cancelar
+            cancelButton.addEventListener('click', cancelProcessing);
             
-            // Adiciona um listener ao clique do botão
+            // Função principal de vetorização
             vectorizeButton.addEventListener('click', async () => {
                 if (fileInput.files.length === 0) {
-                    updateStatus('Erro: Por favor, selecione um arquivo JSON primeiro.');
+                    updateStatus('Erro: Por favor, selecione um arquivo JSON primeiro.', 'error');
                     return;
                 }
 
+                if (isProcessing) {
+                    updateStatus('Processamento já em andamento...', 'error');
+                    return;
+                }
+
+                isProcessing = true;
+                shouldCancel = false;
                 vectorizeButton.disabled = true;
+                cancelButton.style.display = 'inline-block';
+                
                 const file = fileInput.files[0];
 
                 try {
-                    updateStatus(`Lendo o arquivo: ${file.name}...`);
+                    // Leitura do arquivo
+                    updateStatus(`Lendo o arquivo: ${file.name}...`, 'info', 5);
                     const fileContent = await file.text();
-                    const data = JSON.parse(fileContent);
+                    
+                    if (shouldCancel) {
+                        cancelProcessing();
+                        return;
+                    }
+                    
+                    // Parsing do JSON
+                    updateStatus('Analisando estrutura do arquivo...', 'info', 10);
+                    let data;
+                    try {
+                        data = JSON.parse(fileContent);
+                    } catch (parseError) {
+                        throw new Error(`Erro ao analisar JSON: ${parseError.message}`);
+                    }
+                    
+                    // Validação da estrutura
+                    updateStatus('Validando estrutura do arquivo...', 'info', 15);
+                    validateJSONStructure(data);
+                    
+                    if (shouldCancel) {
+                        cancelProcessing();
+                        return;
+                    }
 
-                    updateStatus('Carregando o modelo de embedding... (Isso pode levar um tempo na primeira vez)');
+                    // Carregamento do modelo
+                    updateStatus('Carregando modelo de embedding... (Primeira vez pode demorar)', 'info', 20);
+                    
                     const extractor = await pipeline('feature-extraction', 'Xenova/paraphrase-multilingual-MiniLM-L12-v2', {
                         progress_callback: (progress) => {
-                            updateStatus(`Carregando modelo: ${progress.file} (${Math.round(progress.progress)}%)`);
+                            if (shouldCancel) return;
+                            const modelProgress = 20 + (progress.progress * 0.3); // 20% a 50%
+                            updateStatus(`Carregando modelo: ${progress.file}`, 'info', modelProgress);
                         }
                     });
                     
-                    updateStatus('Extraindo textos para vetorização...');
+                    if (shouldCancel) {
+                        cancelProcessing();
+                        return;
+                    }
+                    
+                    // Extração de chunks
+                    updateStatus('Extraindo textos para vetorização...', 'info', 55);
                     const chunksParaVetorizar = [];
+                    
                     for (const doc of data.documents || []) {
+                        if (shouldCancel) {
+                            cancelProcessing();
+                            return;
+                        }
+                        
                         const allChunks = [
                             ...(doc.tese_juridica_chunks || []),
                             ...(doc.fundamentacao_chunks || []),
                             ...(doc.conclusao_chunks || []),
                             ...(doc.dod_teste_chunks || [])
                         ];
+                        
                         for (const chunk of allChunks) {
-                            chunksParaVetorizar.push({
-                                document_id: doc.id_info,
-                                chunk_id: chunk.chunk_id,
-                                text: chunk.text
-                            });
+                            if (chunk.text && chunk.text.trim()) {
+                                chunksParaVetorizar.push({
+                                    document_id: doc.id_info,
+                                    chunk_id: chunk.chunk_id,
+                                    text: chunk.text,
+                                    chunk_type: chunk.chunk_type || 'unknown'
+                                });
+                            }
                         }
                     }
+                    
                     const textos = chunksParaVetorizar.map(chunk => chunk.text);
                     
-                    updateStatus(`Vetorizando ${textos.length} trechos de texto...`);
-                    const embeddings = await extractor(textos, { pooling: 'mean', normalize: true });
-
-                    const embeddingsArray = Array.from(embeddings.data);
-                    const embeddingDimension = embeddings.dims[1];
-
-                    for (let i = 0; i < chunksParaVetorizar.length; i++) {
-                        const start = i * embeddingDimension;
-                        const end = start + embeddingDimension;
-                        chunksParaVetorizar[i].embedding = embeddingsArray.slice(start, end);
+                    if (textos.length === 0) {
+                        throw new Error('Nenhum texto válido encontrado para vetorização');
+                    }
+                    
+                    // Processamento em lotes para arquivos grandes
+                    const batchSize = 50; // Processar 50 textos por vez
+                    const totalBatches = Math.ceil(textos.length / batchSize);
+                    let allEmbeddings = [];
+                    
+                    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+                        if (shouldCancel) {
+                            cancelProcessing();
+                            return;
+                        }
+                        
+                        const start = batchIndex * batchSize;
+                        const end = Math.min(start + batchSize, textos.length);
+                        const batchTextos = textos.slice(start, end);
+                        
+                        const batchProgress = 60 + ((batchIndex / totalBatches) * 35); // 60% a 95%
+                        updateStatus(`Vetorizando lote ${batchIndex + 1}/${totalBatches} (${batchTextos.length} textos)...`, 'info', batchProgress);
+                        
+                        const batchEmbeddings = await extractor(batchTextos, { 
+                            pooling: 'mean', 
+                            normalize: true 
+                        });
+                        
+                        allEmbeddings.push(batchEmbeddings);
+                    }
+                    
+                    if (shouldCancel) {
+                        cancelProcessing();
+                        return;
+                    }
+                    
+                    // Combinação dos embeddings
+                    updateStatus('Processando embeddings...', 'info', 95);
+                    
+                    let embeddingOffset = 0;
+                    for (let batchIndex = 0; batchIndex < allEmbeddings.length; batchIndex++) {
+                        const batchEmbeddings = allEmbeddings[batchIndex];
+                        const embeddingsArray = Array.from(batchEmbeddings.data);
+                        const embeddingDimension = batchEmbeddings.dims[1];
+                        const batchSize = batchEmbeddings.dims[0];
+                        
+                        for (let i = 0; i < batchSize; i++) {
+                            const start = i * embeddingDimension;
+                            const end = start + embeddingDimension;
+                            const chunkIndex = embeddingOffset + i;
+                            
+                            if (chunkIndex < chunksParaVetorizar.length) {
+                                chunksParaVetorizar[chunkIndex].embedding = embeddingsArray.slice(start, end);
+                            }
+                        }
+                        
+                        embeddingOffset += batchSize;
                     }
 
-                    updateStatus(`Vetorização concluída com sucesso! ${chunksParaVetorizar.length} chunks foram vetorizados.`);
-                    vectorizeButton.disabled = false;
-
+                    // Finalização
+                    updateStatus(`Vetorização concluída com sucesso! ${chunksParaVetorizar.length} chunks foram vetorizados.`, 'success', 100);
+                    
                     console.log("Processo de vetorização finalizado:", chunksParaVetorizar);
 
-                    const blob = new Blob([JSON.stringify(chunksParaVetorizar, null, 2)], { type: 'application/json' });
+                    // Criação do arquivo de download
+                    const resultado = {
+                        metadata: {
+                            total_chunks: chunksParaVetorizar.length,
+                            embedding_dimension: chunksParaVetorizar[0]?.embedding?.length || 0,
+                            model_used: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
+                            processed_at: new Date().toISOString(),
+                            original_file: file.name
+                        },
+                        vectorized_chunks: chunksParaVetorizar
+                    };
+                    
+                    const blob = new Blob([JSON.stringify(resultado, null, 2)], { type: 'application/json' });
                     const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'dados_vetorizados.json';
-                    a.textContent = 'Baixar Dados Vetorizados';
+                    const downloadLink = document.createElement('a');
+                    downloadLink.href = url;
+                    downloadLink.download = `dados_vetorizados_${Date.now()}.json`;
+                    downloadLink.textContent = '📥 Baixar Dados Vetorizados';
+                    downloadLink.className = 'download-link';
+                    
                     statusDiv.appendChild(document.createElement('br'));
-                    statusDiv.appendChild(a);
+                    statusDiv.appendChild(downloadLink);
+                    
+                    // Limpa URL do objeto após 5 minutos
+                    setTimeout(() => URL.revokeObjectURL(url), 300000);
 
                 } catch (error) {
-                    updateStatus(`Ocorreu um erro: ${error.message}`);
-                    console.error(error);
+                    console.error('Erro detalhado:', error);
+                    updateStatus(`Erro: ${error.message}`, 'error');
+                } finally {
                     vectorizeButton.disabled = false;
+                    cancelButton.style.display = 'none';
+                    isProcessing = false;
+                    shouldCancel = false;
                 }
             });
         });
